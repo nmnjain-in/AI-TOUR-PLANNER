@@ -2,13 +2,20 @@
 ============================================================================
  AI TOUR PLANNER  —  Backend (index.py)
 ============================================================================
- Flask app that:
-   1. Serves the frontend (index.html) at "/", "/index.html" and any
-      non-API path (SPA fallback) — fixes "Unknown endpoint" errors.
-   2. Exposes a JSON API powered by Google Gemini with a multi-model
-      fallback chain (gemini-3.8-flash -> ... -> gemini-2.0-flash).
-   3. Stores every generated plan in MongoDB (auto-falls back to a local
-      JSON file if MONGODB_URI is not set, so the app always works).
+ Flask backend for the "AI Tour Planner" frontend (index.html).
+ Serves index.html at "/", "/index.html" and any non-API path, and
+ implements the EXACT API contract the frontend expects:
+
+     POST   /api/plan                    -> generate a plan with Gemini
+     GET    /api/plans?limit=12          -> list cloud trips (history)
+     GET    /api/plan/<share_id>         -> open / share a saved plan
+     DELETE /api/plan/<share_id>         -> delete a plan
+     POST   /api/plan/<share_id>/feedback -> rate a plan (1 / -1 / 0)
+     GET    /api/health                 -> service status
+
+ Plans are stored in MongoDB (set MONGODB_URI). If MongoDB is not
+ configured, a local JSON file is used so the app still works (sharing
+ and cross-device history then need MONGODB_URI).
 
  --------------------------------------------------------------------------
  RUN LOCALLY
@@ -33,17 +40,17 @@
 
    Then:  vercel --prod
 
-   Set these env vars in Vercel (Project -> Settings -> Environment
-   Variables) — values below are only fallbacks:
-     GEMINI_API_KEY   your Google Gemini API key
-     MONGODB_URI      e.g. mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/
+   Set env vars in Vercel -> Settings -> Environment Variables:
+     GEMINI_API_KEY   your Google Gemini API key (free: aistudio.google.com)
+     MONGODB_URI      e.g. mongodb+srv://user:pass@cluster0.xxx.mongodb.net/
 ============================================================================
 """
 
 import os
 import json
 import uuid
-from datetime import datetime
+import secrets
+from datetime import datetime, date
 
 import requests
 from flask import Flask, request, jsonify, send_file
@@ -72,43 +79,65 @@ HEADERS = {"Content-Type": "application/json", "X-goog-api-key": GEMINI_API_KEY}
 MONGODB_URI = os.environ.get("MONGODB_URI", "")
 FALLBACK_FILE = os.path.join("/tmp", "tour_plans.json")
 
+# Exact option values used by the frontend (do not change these strings).
 VALID = {
+    "group_types": ["Group", "Solo"],
     "age_groups": [
-        "Under 18 (Kids & Teens)",
-        "18-25 (Young Adults)",
-        "26-35 (Adults)",
-        "36-50 (Adults)",
-        "51-60 (Mature Adults)",
-        "60+ (Seniors)",
+        "18 - 25 (Young Adults / Students)",
+        "25 - 35 (Working Professionals)",
+        "35 - 50 (Family / Middle Age)",
+        "50 - 65 (Senior Citizens)",
+        "65+ (Elderly)",
+        "Mixed Age Group (Kids + Adults + Seniors)",
     ],
-    "relationships": ["Friends", "Family", "Colleagues", "Couples",
-                      "Family with Kids"],
-    "budget_tiers": ["Budget", "Mid-range", "Premium", "Luxury"],
-    "transports": ["Flight", "Bus", "Train", "Personal"],
-    "vehicles": ["CAR", "SUV", "VAN", "BIKE"],
-    "food_prefs": ["Vegetarian", "Non-Vegetarian", "Vegan", "Eggetarian",
-                   "Jain", "Mixed / No Restrictions"],
-    "stays": ["Hotel (1-3 Star)", "Hotel (4-5 Star)", "Resort",
-              "Homestay / Airbnb", "Hostel", "Dharamshala / Budget Stay",
-              "Glamping / Camping"],
-}
-
-BUDGET_RANGES = {
-    "Budget":    "INR 800 - INR 1,500 per person per day",
-    "Mid-range": "INR 2,000 - INR 4,500 per person per day",
-    "Premium":   "INR 5,000 - INR 12,000 per person per day",
-    "Luxury":    "INR 12,000+ per person per day",
+    "relationships": [
+        "Singles Group (Solo / Friends)",
+        "Couples Group (Romantic / Honeymoon)",
+        "Family with Kids",
+        "Mixed Group (Singles + Couples)",
+        "All Boys / All Girls Friends Trip",
+    ],
+    "budget_ranges": [
+        "Low Range (Budget / Backpacker - ₹800-₹1500/day per person)",
+        "Mid Range (Comfortable - ₹2000-₹4500/day per person)",
+        "High Range (Premium / Luxury - ₹5000-₹12000/day per person)",
+        "Ultra Luxury (5 Star / Private Everything)",
+    ],
+    "transports": [
+        "Flight ✈️",
+        "Bus (Volvo / Sleeper / State) 🚌",
+        "Train (Vande Bharat / Express) 🚂",
+        "Personal Vehicle 🚗",
+    ],
+    "vehicles": ["CAR", "SUV", "BIK", "VAN"],
+    "diets": [
+        "Pure Vegetarian 🥬",
+        "Non-Veg 🍗",
+        "Non-Veg + Veg (Both) 🍗🥬",
+        "Jainism Type (No Onion, No Garlic) 🙏",
+        "Vegan 🌱",
+        "Eggetarian 🥚",
+    ],
+    "stays": [
+        "Hotels (Standard / 3-Star / 4-Star)",
+        "Dharamshalas / Ashrams / Temple Trusts 🙏",
+        "Hostels (Zostel / Backpacker Dorms) 🏠",
+        "Homestays (Local Family / Village Vibe) 🏡",
+        "Luxury Resorts / Riverside Cottages 🏖️",
+        "Camping / Tents / Glamping ⛺",
+        "Any place is fine (Best budget combo)",
+    ],
 }
 
 
 # --------------------------------------------------------------------------
-# MONGODB (with local JSON fallback so the app never breaks)
+# STORAGE: MongoDB with automatic local-JSON fallback
 # --------------------------------------------------------------------------
 _client = None
 
 
 def get_db():
-    """Return the plans collection, or None if Mongo is unavailable."""
+    """Return the plans collection, or None when Mongo is unavailable."""
     global _client
     if not MONGODB_URI:
         return None
@@ -133,12 +162,16 @@ def _fallback_load():
 def _fallback_save(docs):
     try:
         with open(FALLBACK_FILE, "w", encoding="utf-8") as f:
-            json.dump(docs, f, ensure_ascii=False, indent=2)
+            json.dump(docs, f, ensure_ascii=False, indent=1)
     except Exception:
         pass
 
 
-def save_plan(doc):
+def _new_share_id():
+    return uuid.uuid4().hex[:16]
+
+
+def db_save(doc):
     db = get_db()
     if db is not None:
         db.insert_one(dict(doc))
@@ -146,43 +179,58 @@ def save_plan(doc):
         docs = _fallback_load()
         docs.append(doc)
         _fallback_save(docs)
-    return doc["plan_id"]
+    return doc["share_id"]
 
 
-def list_plans(limit=20):
+def db_list(limit=12):
     db = get_db()
     if db is not None:
-        cur = db.find({}, {"plan": 0}).sort("created_at", -1).limit(limit)
+        cur = (db.find({}, {"plan_text": 0, "profile": 0})
+                 .sort("created_ts", -1).limit(limit))
         return list(cur)
-    return sorted(_fallback_load(), key=lambda x: x.get("created_at", ""),
+    return sorted(_fallback_load(),
+                  key=lambda x: x.get("created_ts", 0),
                   reverse=True)[:limit]
 
 
-def get_plan(pid):
+def db_get(share_id):
     db = get_db()
     if db is not None:
-        return db.find_one({"plan_id": pid})
+        return db.find_one({"share_id": share_id})
     for doc in _fallback_load():
-        if doc.get("plan_id") == pid:
+        if doc.get("share_id") == share_id:
             return doc
     return None
 
 
-def delete_plan(pid):
+def db_delete(share_id):
     db = get_db()
     if db is not None:
-        return db.delete_one({"plan_id": pid}).deleted_count > 0
+        return db.delete_one({"share_id": share_id}).deleted_count > 0
     docs = _fallback_load()
-    new = [d for d in docs if d.get("plan_id") != pid]
+    new = [d for d in docs if d.get("share_id") != share_id]
     _fallback_save(new)
     return len(new) != len(docs)
 
 
+def db_update(share_id, fields):
+    db = get_db()
+    if db is not None:
+        db.update_one({"share_id": share_id}, {"$set": fields})
+        return db.find_one({"share_id": share_id})
+    docs = _fallback_load()
+    for doc in docs:
+        if doc.get("share_id") == share_id:
+            doc.update(fields)
+            _fallback_save(docs)
+            return doc
+    return None
+
+
 # --------------------------------------------------------------------------
-# GEMINI API  (multi-model fallback)
+# GEMINI (multi-model fallback chain)
 # --------------------------------------------------------------------------
 def call_gemini_api(prompt):
-    """Try each model in order; return (text, model_used). Raise on total fail."""
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.7, "maxOutputTokens": 8192},
@@ -195,245 +243,260 @@ def call_gemini_api(prompt):
             if res.status_code != 200:
                 last_err = "%s -> HTTP %d" % (model, res.status_code)
                 continue
-            text = (res.json()["candidates"][0]["content"]["parts"][0]["text"])
+            text = res.json()["candidates"][0]["content"]["parts"][0]["text"]
             if text and text.strip():
                 return text, model
             last_err = "%s -> empty response" % model
         except Exception as exc:
             last_err = "%s -> %s" % (model, exc)
-    raise RuntimeError("All Gemini models failed. Last error: %s" % last_err)
+    raise RuntimeError(last_err)
 
 
 # --------------------------------------------------------------------------
-# PROMPT BUILDER  (mirrors the original CLI script)
+# VALIDATION  (mirrors the frontend wizard rules)
 # --------------------------------------------------------------------------
-def build_gemini_prompt(d):
-    total_days = d["total_days"]
-    if d["date_mode"] == "dates" and d.get("start_date") and d.get("end_date"):
-        duration = "%d days (%s to %s)" % (total_days, d["start_date"],
-                                           d["end_date"])
-    else:
-        duration = "%d days" % total_days
-
-    if d["group_type"] == "solo":
-        group_line = "Solo traveler (1 person)"
-    else:
-        group_line = "Group of %d people" % d["group_size"]
-
-    member_lines = []
-    for i, m in enumerate(d["members"], 1):
-        member_lines.append("    %d. %s | Age %s | Gender %s"
-                            % (i, m["name"], m["age"], m["gender"]))
-    members_block = "\n".join(member_lines)
-
-    lines = []
-    lines.append("You are an expert AI travel planner with deep local "
-                 "knowledge of destinations across the world.")
-    lines.append("Create a complete, detailed and personalized tour plan "
-                 "for the trip described below.")
-    lines.append("")
-    lines.append("========== TRIP DETAILS ==========")
-    lines.append("Destination        : %s" % d["destination"])
-    lines.append("Group Type         : %s" % group_line)
-    lines.append("Age Group          : %s" % d["age_group"])
-    lines.append("Trip Duration      : %s" % duration)
-    lines.append("Traveler Details   :")
-    lines.append(members_block)
-    lines.append("Relationship       : %s" % d["relationship"])
-    lines.append("Budget Category    : %s (%s)"
-                 % (d["budget_tier"], BUDGET_RANGES[d["budget_tier"]]))
-    if d.get("total_budget"):
-        lines.append("Total Trip Budget  : INR %s (plan strictly within this "
-                    "total amount)" % d["total_budget"])
-    lines.append("Preferred Transport: %s" % d["transport"])
-    if d["transport"] == "Personal":
-        lines.append("Personal Vehicle   : %s with %s seats"
-                     % (d.get("vehicle_type", "CAR"), d.get("vehicle_seats", 4)))
-    lines.append("Food Preference    : %s" % d["food_preference"])
-    if d.get("allergies"):
-        lines.append("Allergies / Food restrictions to avoid: %s"
-                     % d["allergies"])
-    lines.append("Stay Preference    : %s" % d["stay_preference"])
-    lines.append("")
-    lines.append("========== REQUIRED OUTPUT FORMAT ==========")
-    lines.append("Write the plan in markdown and include these EXACT 6 "
-                 "sections with these headers:")
-    lines.append("1. '# \U0001F4CD Must-Visit Places & Hidden Gems' — top "
-                 "attractions plus lesser-known local gems, with a one-line "
-                 "reason and typical entry ticket price in INR for each.")
-    lines.append("2. '# \U0001F5FA Day-by-Day Itinerary' — a full plan for "
-                 "ALL %d days, each day split into Morning / Afternoon / "
-                 "Evening with specific places, timings and travel tips."
-                 % total_days)
-    lines.append("3. '# \U0001F3E8 Recommended Stays' — 2-3 property "
-                 "suggestions matching the stay preference, with approximate "
-                 "price per night in INR.")
-    lines.append("4. '# \U0001F37D Food & Restaurants' — where to eat, "
-                 "matching the food preference, with must-try dishes and "
-                 "approximate cost per meal in INR.")
-    lines.append("5. '# \U0001F4B0 Detailed Budget Breakdown' — a realistic "
-                 "table (Stay / Food / Transport / Tickets / Miscellaneous) "
-                 "per person and grand total in INR.")
-    lines.append("6. '# \U0001F392 Packing & Safety Advice' — packing list "
-                 "for this destination and season, plus safety tips and "
-                 "emergency contacts.")
-    lines.append("")
-    lines.append("Be specific, use real place names, keep all money in INR, "
-                 "and make the plan practical for the group described above.")
-    return "\n".join(lines)
-
-
-# --------------------------------------------------------------------------
-# REQUEST VALIDATION  (mirrors the CLI input rules)
-# --------------------------------------------------------------------------
-def validate_request(d):
+def validate_profile(d):
     errors = []
 
     def s(v):
         return str(v).strip() if v is not None else ""
 
-    clean = {}
+    p = {}
+    p["city"] = s(d.get("city"))
+    if len(p["city"]) < 2:
+        errors.append("Please enter your destination city (min 2 characters).")
 
-    destination = s(d.get("destination"))
-    if len(destination) < 5:
-        errors.append("Destination must be at least 5 characters.")
-    clean["destination"] = destination
+    p["destination"] = s(d.get("destination"))
+    if len(p["destination"]) < 5:
+        errors.append("Q1: describe your tour theme in at least 5 characters.")
 
-    group_type = s(d.get("group_type")).lower()
-    if group_type not in ("solo", "group"):
-        errors.append("Group type must be 'solo' or 'group'.")
-        group_type = "solo"
-    clean["group_type"] = group_type
-
+    grp = d.get("group") or {}
+    gtype = s(grp.get("type")) or ("Group" if grp.get("type") else "")
+    if gtype not in VALID["group_types"]:
+        errors.append("Q2: group type must be 'Group' or 'Solo'.")
+        gtype = "Solo"
     try:
-        group_size = int(d.get("group_size", 1))
+        count = int(grp.get("count", 1))
     except (TypeError, ValueError):
-        group_size = 1
-    if group_type == "solo":
-        group_size = 1
-    elif not (2 <= group_size <= 100):
-        errors.append("Group size must be between 2 and 100 for groups.")
-        group_size = 1
-    clean["group_size"] = group_size
+        count = 1
+    if gtype == "Solo":
+        count = 1
+    elif not (2 <= count <= 100):
+        errors.append("Q2: group size must be between 2 and 100 people.")
+        count = 1
+    p["group_type"] = gtype
+    p["count"] = count
 
-    age_group = s(d.get("age_group"))
-    if age_group not in VALID["age_groups"]:
-        errors.append("Invalid age group.")
-    clean["age_group"] = age_group
+    p["age_group"] = s(d.get("age_group"))
+    if p["age_group"] not in VALID["age_groups"]:
+        errors.append("Q3: invalid age group.")
 
-    # --- dates: either total days, or a DD/MM/YYYY range (1-120 days) ---
-    date_mode = s(d.get("date_mode")) or "days"
-    total_days = None
-    start_date = s(d.get("start_date")) or None
-    end_date = s(d.get("end_date")) or None
-    if date_mode == "dates":
+    # --- travel: total days OR a DD/MM/YYYY calendar range (1-120 days) ---
+    trav = d.get("travel") or {}
+    ttype = s(trav.get("type")) or "days"
+    p["travel"] = {"type": ttype, "duration": None,
+                   "start": "", "end": "", "display": ""}
+    if ttype == "dates":
         try:
-            sd = datetime.strptime(start_date, "%d/%m/%Y").date()
-            ed = datetime.strptime(end_date, "%d/%m/%Y").date()
+            sd = datetime.strptime(s(trav.get("start")), "%d/%m/%Y").date()
+            ed = datetime.strptime(s(trav.get("end")), "%d/%m/%Y").date()
+        except (TypeError, ValueError):
+            errors.append("Q4: start/end dates must be valid DD/MM/YYYY.")
+            sd = ed = None
+        if sd and ed:
             if ed < sd:
-                errors.append("End date cannot be before start date.")
-            total_days = (ed - sd).days + 1
-            if total_days < 1 or total_days > 120:
-                errors.append("Trip must be between 1 and 120 days.")
-                total_days = None
-        except (TypeError, ValueError):
-            errors.append("Start/end dates must be valid DD/MM/YYYY.")
+                errors.append("Q4: end date must be after start date.")
+            else:
+                dur = (ed - sd).days
+                if 1 <= dur <= 120:
+                    p["travel"] = {"type": "dates", "duration": dur,
+                                   "start": s(trav.get("start")),
+                                   "end": s(trav.get("end")),
+                                   "display": "%s to %s (%d Days with Full Year)"
+                                              % (s(trav.get("start")),
+                                                 s(trav.get("end")), dur)}
+                else:
+                    errors.append("Q4: trip must be between 1 and 120 days.")
     else:
         try:
-            total_days = int(d.get("total_days"))
-            if not (1 <= total_days <= 120):
-                errors.append("Total days must be between 1 and 120.")
-                total_days = None
-        except (TypeError, ValueError):
-            errors.append("Total days must be a number between 1 and 120.")
-    if total_days is None:
-        errors.append("A valid trip duration is required.")
-    clean["date_mode"] = date_mode
-    clean["total_days"] = total_days
-    clean["start_date"] = start_date
-    clean["end_date"] = end_date
-
-    # --- members: one row per traveler, ages 1-120, gender M/F/O ---
-    members = d.get("members") or []
-    if not isinstance(members, list) or len(members) != group_size:
-        errors.append("Member details are required for all %d traveler(s)."
-                      % group_size)
-        members = []
-    else:
-        for i, m in enumerate(members, 1):
-            name = s(m.get("name"))
-            if len(name) < 2:
-                errors.append("Member %d: name is required (min 2 characters)."
-                              % i)
-            try:
-                age = int(m.get("age"))
-                if not (1 <= age <= 120):
-                    raise ValueError
-            except (TypeError, ValueError):
-                age = None
-                errors.append("Member %d: age must be between 1 and 120." % i)
-            gender = s(m.get("gender")).upper()
-            if gender not in ("M", "F", "O"):
-                gender = None
-                errors.append("Member %d: gender must be M, F or O." % i)
-            members[i - 1] = {"name": name, "age": age, "gender": gender}
-    clean["members"] = members
-
-    relationship = s(d.get("relationship"))
-    if relationship not in VALID["relationships"]:
-        errors.append("Invalid relationship type.")
-    clean["relationship"] = relationship
-
-    budget_tier = s(d.get("budget_tier"))
-    if budget_tier not in VALID["budget_tiers"]:
-        errors.append("Invalid budget tier.")
-    clean["budget_tier"] = budget_tier
-
-    total_budget = s(d.get("total_budget"))
-    if total_budget:
-        try:
-            tb = int(float(total_budget))
-            if tb <= 0:
+            dur = int(trav.get("duration"))
+            if not (1 <= dur <= 120):
                 raise ValueError
         except (TypeError, ValueError):
-            errors.append("Total budget must be a positive number.")
-            total_budget = None
-    clean["total_budget"] = total_budget or None
+            dur = None
+            errors.append("Q4: total days must be between 1 and 120.")
+        if dur:
+            p["travel"] = {"type": "days", "duration": dur, "start": "",
+                           "end": "", "display": "%d Days Trip" % dur}
+    if p["travel"]["duration"] is None:
+        errors.append("Q4: a valid trip duration is required.")
 
-    transport = s(d.get("transport"))
-    if transport not in VALID["transports"]:
-        errors.append("Invalid transport option.")
-    clean["transport"] = transport
-
-    vehicle_type = s(d.get("vehicle_type")).upper()
-    if transport == "Personal":
-        if vehicle_type not in VALID["vehicles"]:
-            errors.append("Vehicle type must be CAR, SUV, VAN or BIKE.")
-            vehicle_type = "CAR"
+    # --- members: one entry per traveler (names optional) ---
+    mem = d.get("members") or {}
+    raw_list = mem.get("list") or []
+    if not isinstance(raw_list, list) or len(raw_list) != count:
+        errors.append("Q5: traveler details are required for all %d "
+                      "traveler(s)." % count)
+        raw_list = []
+    members = []
+    for i, m in enumerate(raw_list, 1):
+        name = s(m.get("name")) or ("Traveler %d" % i)
         try:
-            seats = int(d.get("vehicle_seats"))
-            if not (1 <= seats <= 50):
+            age = int(m.get("age"))
+            if not (1 <= age <= 120):
                 raise ValueError
         except (TypeError, ValueError):
-            seats = None
-            errors.append("Vehicle seats must be between 1 and 50.")
+            age = None
+            errors.append("Q5: traveler %d needs a valid age (1-120)." % i)
+        gender = s(m.get("gender")).capitalize()
+        gender = gender if gender in ("Male", "Female", "Other") else None
+        if not gender:
+            gender = "Other"
+            errors.append("Q5: traveler %d needs a gender (M/F/Other)." % i)
+        members.append({"name": name, "age": age, "gender": gender})
+    p["members"] = {
+        "males": sum(1 for m in members if m["gender"] == "Male"),
+        "females": sum(1 for m in members if m["gender"] == "Female"),
+        "list": members,
+    }
+
+    p["relationship"] = s(d.get("relationship"))
+    if p["relationship"] not in VALID["relationships"]:
+        errors.append("Q6: invalid group composition.")
+
+    bud = d.get("budget") or {}
+    p["budget"] = s(bud.get("range"))
+    if p["budget"] not in VALID["budget_ranges"]:
+        errors.append("Q7: invalid budget range.")
+    amount = s(bud.get("amount"))
+    if amount:
+        if not amount.isdigit() or int(amount) <= 0:
+            errors.append("Q7: total budget must be a positive number.")
+            amount = ""
+    p["budget_amount"] = amount
+
+    tra = d.get("transport") or {}
+    p["transport"] = s(tra.get("mode"))
+    if p["transport"] not in VALID["transports"]:
+        errors.append("Q8: invalid mode of transport.")
+    p["vehicle"] = s(tra.get("vehicle"))
+    p["seats"] = s(tra.get("seats"))
+    if "Personal Vehicle" in p["transport"]:
+        if p["vehicle"] not in VALID["vehicles"]:
+            errors.append("Q8: pick a personal vehicle type (CAR/SUV/BIK/VAN).")
+            p["vehicle"] = ""
+        if p["seats"]:
+            if not p["seats"].isdigit() or not (1 <= int(p["seats"]) <= 50):
+                errors.append("Q8: seats must be between 1 and 50.")
+                p["seats"] = ""
     else:
-        vehicle_type, seats = None, None
-    clean["vehicle_type"] = vehicle_type
-    clean["vehicle_seats"] = seats
+        p["vehicle"] = p["vehicle"] if p["vehicle"] in VALID["vehicles"] else ""
+        p["seats"] = p["seats"] if p["seats"].isdigit() else ""
 
-    food_preference = s(d.get("food_preference"))
-    if food_preference not in VALID["food_prefs"]:
-        errors.append("Invalid food preference.")
-    clean["food_preference"] = food_preference
-    clean["allergies"] = s(d.get("allergies")) or None
+    food = d.get("food") or {}
+    p["food"] = s(food.get("diet"))
+    if p["food"] not in VALID["diets"]:
+        errors.append("Q9: invalid food preference.")
+    p["allergies"] = s(food.get("allergy"))[:100]
 
-    stay_preference = s(d.get("stay_preference"))
-    if stay_preference not in VALID["stays"]:
-        errors.append("Invalid stay preference.")
-    clean["stay_preference"] = stay_preference
+    p["stay"] = s(d.get("stay"))
+    if p["stay"] not in VALID["stays"]:
+        errors.append("Q10: invalid stay preference.")
 
-    return (len(errors) == 0), errors, clean
+    return (len(errors) == 0), errors, p
+
+
+# --------------------------------------------------------------------------
+# PROMPT BUILDER
+# --------------------------------------------------------------------------
+def build_gemini_prompt(p):
+    if p["group_type"] == "Solo":
+        group_line = "Solo traveler (1 person)"
+    else:
+        group_line = "Group of %d people" % p["count"]
+
+    trav = p["travel"]
+    if trav["type"] == "dates":
+        duration = ("%d days (%s to %s) — Gemini must date every single day"
+                    % (trav["duration"], trav["start"], trav["end"]))
+    else:
+        duration = "%d days" % trav["duration"]
+
+    member_lines = "\n".join(
+        "    %d. %s | Age %s | %s" % (i, m["name"], m["age"], m["gender"])
+        for i, m in enumerate(p["members"]["list"], 1))
+
+    transport_line = p["transport"]
+    if p["vehicle"]:
+        transport_line += " - [%s]" % p["vehicle"]
+    if p["seats"]:
+        transport_line += " (Seater: %s)" % p["seats"]
+
+    food_line = p["food"] + ((" | Allergies/restrictions: " + p["allergies"])
+                             if p["allergies"] else "")
+
+    budget_line = p["budget"]
+    if p["budget_amount"]:
+        budget_line += " | Target TOTAL budget for the whole group: ₹%s — " \
+                       "plan strictly within this amount" % p["budget_amount"]
+
+    lines = [
+        "You are an expert AI travel planner with deep local knowledge. "
+        "Create a complete, personalized tour plan for the profile below.",
+        "",
+        "================ TRIP PROFILE ================",
+        "Base City           : %s" % p["city"],
+        "Tour Theme / Focus  : %s" % p["destination"],
+        "Group Type          : %s" % group_line,
+        "Age Group           : %s" % p["age_group"],
+        "Trip Duration       : %s" % duration,
+        "Travelers           :",
+        member_lines,
+        "Group Composition   : %s" % p["relationship"],
+        "Budget              : %s" % budget_line,
+        "Transport           : %s" % transport_line,
+        "Food Preference     : %s" % food_line,
+        "Stay Preference     : %s" % p["stay"],
+        "",
+        "================ REQUIRED OUTPUT FORMAT ================",
+        "Write the whole plan in Markdown, in this EXACT structure:",
+        "",
+        "# <Catchy Trip Title> — <City>",
+        "",
+        "## 📍 Must-Visit Places & Hidden Gems",
+        "A short list of top attractions plus lesser-known local gems, each "
+        "with a one-line reason and typical entry ticket price in ₹.",
+        "",
+        "## 🗺️ Day-by-Day Itinerary",
+        "One block for EVERY day of the trip (all %d days), each block "
+        "formatted exactly like this:" % trav["duration"],
+        "**Day 1 — <short day title>**",
+        "**Morning:** <activity, place, timing>",
+        "**Afternoon:** <activity, place, timing>",
+        "**Evening:** <activity, place, timing>",
+        "",
+        "## 🏨 Recommended Stays",
+        "2-3 properties matching the stay preference, with approximate price "
+        "per night in ₹ for the group.",
+        "",
+        "## 🍽️ Food & Restaurants",
+        "Where to eat (matching the food preference), must-try dishes and "
+        "approximate cost per meal in ₹.",
+        "",
+        "## 💰 Detailed Budget Breakdown",
+        "A markdown table with columns Category | Details | Cost (₹) covering "
+        "Stay, Food, Transport, Tickets, Miscellaneous, ending with a line: "
+        "**Total Estimated Cost: ₹<number>** for the whole group.",
+        "",
+        "## 🎒 Packing & Safety Advice",
+        "Packing list for this destination/season plus safety tips and "
+        "emergency contacts.",
+        "",
+        "Rules: use real place names, keep ALL money in Indian Rupees (₹), "
+        "match every recommendation to the profile above, and be practical "
+        "and specific.",
+    ]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -450,7 +513,6 @@ def cors(resp):
 @app.route("/", defaults={"path": ""})
 @app.route("/<path:path>")
 def catch_all(path):
-    """Serve the frontend for every non-API path (fixes Unknown endpoint)."""
     if path.startswith("api/"):
         return jsonify({"success": False,
                         "error": "Unknown endpoint: %s /%s"
@@ -469,75 +531,109 @@ def api_health():
                     "models": GEMINI_MODELS})
 
 
-@app.route("/api/options")
-def api_options():
-    return jsonify({"success": True, "options": VALID,
-                    "budget_ranges": BUDGET_RANGES})
-
-
-@app.route("/api/generate", methods=["POST", "OPTIONS"])
-def api_generate():
+# ---- POST /api/plan : generate a plan ------------------------------------
+@app.route("/api/plan", methods=["POST", "OPTIONS"])
+def api_create_plan():
     if request.method == "OPTIONS":
         return ("", 204)
     data = request.get_json(silent=True) or {}
-    ok, errors, clean = validate_request(data)
+    ok, errors, profile = validate_profile(data)
     if not ok:
         return jsonify({"success": False,
-                        "error": "Please fix the highlighted answers.",
-                        "details": errors}), 400
+                        "error": "Please complete the highlighted steps.",
+                        "details": errors,
+                        "hint": "Go back and fix the items listed above."}), 400
 
-    prompt = build_gemini_prompt(clean)
+    prompt = build_gemini_prompt(profile)
     try:
-        plan_text, model_used = call_gemini_api(prompt)
+        plan_text, model = call_gemini_api(prompt)
     except Exception as exc:
         return jsonify({"success": False,
-                        "error": "Gemini API failed: %s" % exc}), 502
+                        "error": "Gemini API failed: %s" % exc,
+                        "hint": "Wait a moment and tap Retry."}), 502
 
     doc = {
-        "plan_id": uuid.uuid4().hex,
-        "destination": clean["destination"],
-        "group_type": clean["group_type"],
-        "group_size": clean["group_size"],
-        "total_days": clean["total_days"],
-        "budget_tier": clean["budget_tier"],
-        "transport": clean["transport"],
-        "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "model_used": model_used,
-        "request": clean,
-        "plan": plan_text,
+        "share_id": _new_share_id(),
+        "destination": profile["city"] or "Trip",
+        "display": profile["travel"]["display"],
+        "city": profile["city"],
+        "plan_text": plan_text,
+        "model": model,
+        "rating": 0,
+        "views": 0,
+        "profile": profile,
+        "created_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_ts": int(datetime.utcnow().timestamp()),
     }
     try:
-        plan_id = save_plan(doc)
+        db_save(doc)
     except Exception:
-        plan_id = None  # storage failure should never kill a generated plan
+        pass  # storage failure must not kill a generated plan
 
-    return jsonify({"success": True, "plan_id": plan_id,
-                    "model": model_used, "plan": plan_text,
-                    "summary": doc["created_at"]})
+    return jsonify({"success": True, "share_id": doc["share_id"],
+                    "plan": plan_text, "model": model, "profile": profile})
 
 
-@app.route("/api/history")
-def api_history():
+# ---- GET /api/plans : cloud history --------------------------------------
+@app.route("/api/plans")
+def api_list_plans():
     try:
-        plans = list_plans(int(request.args.get("limit", 20)))
+        limit = min(50, max(1, int(request.args.get("limit", 12))))
+    except ValueError:
+        limit = 12
+    try:
+        docs = db_list(limit)
     except Exception:
-        plans = []
-    for p in plans:
-        p["plan_id"] = p.get("plan_id") or str(p.get("_id", ""))
-        p.pop("_id", None)
+        docs = []
+    plans = []
+    for d in docs:
+        d.pop("_id", None)
+        d.pop("plan_text", None)
+        d.pop("profile", None)
+        plans.append(d)
     return jsonify({"success": True, "count": len(plans), "plans": plans})
 
 
-@app.route("/api/plan/<pid>", methods=["GET", "DELETE"])
-def api_plan(pid):
+# ---- GET/DELETE /api/plan/<share_id> -------------------------------------
+@app.route("/api/plan/<share_id>", methods=["GET", "DELETE"])
+def api_get_plan(share_id):
+    share_id = "".join(c for c in share_id if c.isalnum() or c in "_-")
     if request.method == "DELETE":
-        deleted = delete_plan(pid)
-        return jsonify({"success": deleted}), (200 if deleted else 404)
-    doc = get_plan(pid)
+        deleted = db_delete(share_id)
+        return jsonify({"success": bool(deleted)}), (200 if deleted else 404)
+
+    doc = db_get(share_id)
+    if not doc:
+        return jsonify({"success": False,
+                        "error": "Plan not found.",
+                        "hint": "This trip may have been deleted."}), 404
+    doc.pop("_id", None)
+    try:
+        db_update(share_id, {"views": int(doc.get("views", 0)) + 1})
+        doc["views"] = int(doc.get("views", 0)) + 1
+    except Exception:
+        doc["views"] = int(doc.get("views", 0))
+    return jsonify({"success": True, "plan": doc})
+
+
+# ---- POST /api/plan/<share_id>/feedback ----------------------------------
+@app.route("/api/plan/<share_id>/feedback", methods=["POST", "OPTIONS"])
+def api_feedback(share_id):
+    if request.method == "OPTIONS":
+        return ("", 204)
+    share_id = "".join(c for c in share_id if c.isalnum() or c in "_-")
+    data = request.get_json(silent=True) or {}
+    try:
+        rating = int(data.get("rating", 0))
+        if rating not in (1, -1, 0):
+            raise ValueError
+    except (TypeError, ValueError):
+        return jsonify({"success": False,
+                        "error": "rating must be 1, -1 or 0."}), 400
+    doc = db_update(share_id, {"rating": rating})
     if not doc:
         return jsonify({"success": False, "error": "Plan not found."}), 404
-    doc.pop("_id", None)
-    return jsonify({"success": True, "plan": doc})
+    return jsonify({"success": True, "rating": rating})
 
 
 # --------------------------------------------------------------------------
