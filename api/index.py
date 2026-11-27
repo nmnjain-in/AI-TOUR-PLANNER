@@ -1,758 +1,546 @@
 """
 ============================================================================
- AI TOUR PLANNER - Backend (Vercel Serverless Function + MongoDB Atlas)
+ AI TOUR PLANNER  —  Backend (index.py)
 ============================================================================
- Deploy this file as:  api/index.py
- (Vercel runs every Python file inside /api as a serverless function -
-  this single Flask app powers ALL API routes below.)
+ Flask app that:
+   1. Serves the frontend (index.html) at "/", "/index.html" and any
+      non-API path (SPA fallback) — fixes "Unknown endpoint" errors.
+   2. Exposes a JSON API powered by Google Gemini with a multi-model
+      fallback chain (gemini-3.8-flash -> ... -> gemini-2.0-flash).
+   3. Stores every generated plan in MongoDB (auto-falls back to a local
+      JSON file if MONGODB_URI is not set, so the app always works).
 
- ENVIRONMENT VARIABLES (Vercel -> Settings -> Environment Variables):
-   GEMINI_API_KEY   (required) Google Gemini API key
-                    get one free: https://aistudio.google.com/app/apikey
-   MONGODB_URI      (optional) MongoDB Atlas connection string
-                    enables cloud saving, shareable links, history,
-                    ratings & view counters. App works fine without it.
-   MONGODB_DB       (optional) database name (default: ai_tour_planner)
-   GEMINI_MODELS    (optional) comma separated model fallback list
-   GEMINI_TIMEOUT   (optional) per-model timeout seconds (default 50)
+ --------------------------------------------------------------------------
+ RUN LOCALLY
+   pip install flask requests pymongo
+   python index.py            ->  http://localhost:5000
 
- API ENDPOINTS:
-   GET    /api/health                    -> service health check
-   POST   /api/plan                       -> generate a tour plan (Gemini)
-   GET    /api/plans                      -> recent saved plans (metadata)
-   GET    /api/plan/<share_id>            -> fetch one saved plan
-   DELETE /api/plan/<share_id>            -> delete a saved plan
-   POST   /api/plan/<share_id>/feedback   -> rate a plan (+1 / -1)
+ --------------------------------------------------------------------------
+ DEPLOY ON VERCEL  (2 code files + 1 tiny config)
+   Project root:
+     index.html
+     index.py
+     vercel.json        <-- add this file:
 
- LOCAL DEVELOPMENT:
-   pip install -r requirements.txt
-   python api/index.py        ->  http://localhost:5000
-   (the Flask app also serves index.html locally, so the full app
-    works end-to-end on http://localhost:5000)
+     {
+       "version": 2,
+       "builds": [{ "src": "index.py", "use": "@vercel/python" }],
+       "routes": [
+         { "src": "/api/(.*)", "dest": "index.py" },
+         { "src": "/(.*)",     "dest": "index.py" }
+       ]
+     }
+
+   Then:  vercel --prod
+
+   Set these env vars in Vercel (Project -> Settings -> Environment
+   Variables) — values below are only fallbacks:
+     GEMINI_API_KEY   your Google Gemini API key
+     MONGODB_URI      e.g. mongodb+srv://user:pass@cluster0.xxxxx.mongodb.net/
 ============================================================================
 """
 
 import os
-import re
-import time
-import secrets
-from datetime import datetime, timedelta, timezone
+import json
+import uuid
+from datetime import datetime
 
 import requests
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, request, jsonify, send_file
+from pymongo import MongoClient
 
-try:
-    from pymongo import MongoClient
-    _PYMONGO = True
-except Exception:                     # pymongo missing -> app runs without Mongo
-    _PYMONGO = False
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+app = Flask(__name__, static_folder=None)
 
-# ============================== CONFIGURATION ==============================
-
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-MONGODB_URI    = os.environ.get("MONGODB_URI", "").strip()
-MONGODB_DB     = (os.environ.get("MONGODB_DB", "ai_tour_planner").strip()
-                  or "ai_tour_planner")
-
-try:
-    GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "50"))
-except ValueError:
-    GEMINI_TIMEOUT = 50
-GEMINI_TIMEOUT = max(10, min(55, GEMINI_TIMEOUT))
-
-# Gemini models tried in order (first that works wins). Override with the
-# GEMINI_MODELS env var. If every configured model 404s, the server
-# auto-discovers whatever generateContent models the API key supports.
-DEFAULT_MODELS = [
+# --------------------------------------------------------------------------
+# CONFIG
+# --------------------------------------------------------------------------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY",
+                                "")
+GEMINI_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
 ]
-GEMINI_MODELS = [m.strip() for m in
-                 os.environ.get("GEMINI_MODELS", ",".join(DEFAULT_MODELS)).split(",")
-                 if m.strip()]
+GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/"
+              "models/{model}:generateContent")
+HEADERS = {"Content-Type": "application/json", "X-goog-api-key": GEMINI_API_KEY}
 
-GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
+MONGODB_URI = os.environ.get("MONGODB_URI", "")
+FALLBACK_FILE = os.path.join("/tmp", "tour_plans.json")
 
-ROOT_HTML = os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), "index.html")
+VALID = {
+    "age_groups": [
+        "Under 18 (Kids & Teens)",
+        "18-25 (Young Adults)",
+        "26-35 (Adults)",
+        "36-50 (Adults)",
+        "51-60 (Mature Adults)",
+        "60+ (Seniors)",
+    ],
+    "relationships": ["Friends", "Family", "Colleagues", "Couples",
+                      "Family with Kids"],
+    "budget_tiers": ["Budget", "Mid-range", "Premium", "Luxury"],
+    "transports": ["Flight", "Bus", "Train", "Personal"],
+    "vehicles": ["CAR", "SUV", "VAN", "BIKE"],
+    "food_prefs": ["Vegetarian", "Non-Vegetarian", "Vegan", "Eggetarian",
+                   "Jain", "Mixed / No Restrictions"],
+    "stays": ["Hotel (1-3 Star)", "Hotel (4-5 Star)", "Resort",
+              "Homestay / Airbnb", "Hostel", "Dharamshala / Budget Stay",
+              "Glamping / Camping"],
+}
 
-app = Flask(__name__)
-
-# ------------------------------ module caches ------------------------------
-_mongo_client  = None
-_mongo_indexed = False
-_mongo_fail_until = 0.0        # don't retry a dead Atlas for 60s
-_discovered    = None          # cached model auto-discovery
-
-
-# ============================== SMALL HELPERS ==============================
-
-def _txt(value, limit=400):
-    """Clean a user supplied string: collapse whitespace, cap length."""
-    return re.sub(r"\s+", " ", str(value or "")).strip()[:limit]
+BUDGET_RANGES = {
+    "Budget":    "INR 800 - INR 1,500 per person per day",
+    "Mid-range": "INR 2,000 - INR 4,500 per person per day",
+    "Premium":   "INR 5,000 - INR 12,000 per person per day",
+    "Luxury":    "INR 12,000+ per person per day",
+}
 
 
-def _int(value, default, lo, hi):
+# --------------------------------------------------------------------------
+# MONGODB (with local JSON fallback so the app never breaks)
+# --------------------------------------------------------------------------
+_client = None
+
+
+def get_db():
+    """Return the plans collection, or None if Mongo is unavailable."""
+    global _client
+    if not MONGODB_URI:
+        return None
     try:
-        n = int(str(value).strip())
-    except (TypeError, ValueError):
-        return default
-    return max(lo, min(hi, n))
-
-
-def _iso(dt):
-    return dt.isoformat() if isinstance(dt, datetime) else (dt or None)
-
-
-def _json(payload, code=200):
-    resp = jsonify(payload)
-    resp.status_code = code
-    return resp
-
-
-def _parse_dmy(s):
-    try:
-        return datetime.strptime(str(s).strip(), "%d/%m/%Y")
+        if _client is None:
+            _client = MongoClient(MONGODB_URI, serverSelectionTimeoutMS=4000)
+            _client.admin.command("ping")
+        return _client["tour_planner"]["plans"]
     except Exception:
+        _client = None
         return None
 
 
-# ============================== MONGODB LAYER ==============================
-
-def _mongo():
-    """Return a live Mongo database handle, or None when unavailable.
-
-    Connection is cached per warm lambda instance; failures get a
-    60 second cooldown so a dead Atlas does not slow every request.
-    """
-    global _mongo_client, _mongo_indexed, _mongo_fail_until
-    if not _PYMONGO or not MONGODB_URI:
-        return None
-    now = time.time()
-    if _mongo_client is None:
-        if now < _mongo_fail_until:
-            return None
-        try:
-            client = MongoClient(
-                MONGODB_URI,
-                serverSelectionTimeoutMS=4000,
-                connectTimeoutMS=4000,
-                socketTimeoutMS=8000,
-                maxPoolSize=4,
-                appName="ai-tour-planner",
-            )
-            client.admin.command("ping")
-            _mongo_client = client
-        except Exception:
-            _mongo_fail_until = now + 60.0
-            return None
+def _fallback_load():
     try:
-        db = _mongo_client[MONGODB_DB]
-        if not _mongo_indexed:
-            db.plans.create_index([("created_at", -1)])
-            _mongo_indexed = True
-        return db
+        with open(FALLBACK_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        return None
+        return []
 
 
-def _save_plan(doc):
+def _fallback_save(docs):
     try:
-        db = _mongo()
-        if db is None:
-            return False
-        db.plans.insert_one(dict(doc))
-        return True
+        with open(FALLBACK_FILE, "w", encoding="utf-8") as f:
+            json.dump(docs, f, ensure_ascii=False, indent=2)
     except Exception:
-        return False
+        pass
 
 
-def _plan_meta(doc):
-    prof = doc.get("profile") or {}
-    return {
-        "share_id": str(doc.get("share_id") or doc.get("_id")),
-        "destination": prof.get("city") or prof.get("destination") or "Trip",
-        "display": (prof.get("travel") or {}).get("display", ""),
-        "model": doc.get("model"),
-        "rating": doc.get("rating", 0),
-        "views": doc.get("views", 0),
-        "created_at": _iso(doc.get("created_at")),
-        "profile": prof,
-    }
-
-
-# ============================ GEMINI INTEGRATION ============================
-
-def _headers():
-    return {"Content-Type": "application/json", "X-goog-api-key": GEMINI_API_KEY}
-
-
-def _discover_models():
-    """Ask the API which generateContent models this key can actually use."""
-    global _discovered
-    if _discovered is not None:
-        return _discovered
-    _discovered = []
-    try:
-        r = requests.get(f"{GEMINI_BASE}/models?pageSize=200",
-                          headers=_headers(), timeout=10)
-        if r.status_code == 200:
-            names = []
-            for m in r.json().get("models", []):
-                name = str(m.get("name", "")).replace("models/", "")
-                methods = m.get("supportedGenerationMethods", [])
-                if "generateContent" in methods and re.match(
-                        r"^gemini-[\d.]+-(flash|flash-lite|pro)$", name):
-                    names.append(name)
-
-            def key(n):
-                nums = re.findall(r"\d+", n)
-                major = int(nums[0]) if nums else 0
-                minor = int(nums[1]) if len(nums) > 1 else 0
-                prefers_flash = 1 if "flash" in n else 0
-                return (major, minor, prefers_flash)
-
-            names.sort(key=key, reverse=True)
-            _discovered = names[:4]
-    except Exception:
-        _discovered = []
-    return _discovered
-
-
-def _gemini_once(model, prompt):
-    """Call one Gemini model. Returns dict(ok, text|error, status)."""
-    url = f"{GEMINI_BASE}/models/{model}:generateContent"
-    gen_cfg = {"temperature": 0.7, "topP": 0.95, "maxOutputTokens": 8192}
-    # gemini-2.5+ models think by default and burn the time budget -
-    # disable it for the fast flash family.
-    if re.search(r"gemini-(2\.5|[3-9]\.)", model):
-        gen_cfg["thinkingConfig"] = {"thinkingBudget": 0}
-    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
-               "generationConfig": gen_cfg}
-
-    def post():
-        return requests.post(url, headers=_headers(), json=payload,
-                             timeout=GEMINI_TIMEOUT)
-
-    try:
-        r = post()
-    except requests.exceptions.Timeout:
-        return {"ok": False, "status": 0, "error": f"timed out after {GEMINI_TIMEOUT}s"}
-    except Exception as e:
-        return {"ok": False, "status": 0, "error": str(e)[:200]}
-
-    # some model versions reject thinkingConfig - retry once without it
-    if r.status_code == 400 and "thinkingConfig" in gen_cfg:
-        gen_cfg.pop("thinkingConfig", None)
-        try:
-            r = post()
-        except Exception as e:
-            return {"ok": False, "status": 0, "error": str(e)[:200]}
-
-    if r.status_code != 200:
-        return {"ok": False, "status": r.status_code,
-                "error": f"HTTP {r.status_code}: {r.text[:180]}"}
-
-    try:
-        data = r.json()
-        cands = data.get("candidates") or []
-        if not cands:
-            fb = (data.get("promptFeedback") or {}).get("blockReason")
-            why = f" (blocked: {fb})" if fb else ""
-            return {"ok": False, "status": 200,
-                    "error": f"no candidates returned{why}"}
-        parts = (cands[0].get("content") or {}).get("parts") or []
-        text = "".join(p.get("text", "") for p in parts
-                       if isinstance(p, dict)).strip()
-        if not text:
-            return {"ok": False, "status": 200, "error": "empty response"}
-        return {"ok": True, "text": text}
-    except Exception as e:
-        return {"ok": False, "status": 200, "error": f"parse error: {e}"}
-
-
-def call_gemini(prompt):
-    """Try every configured model (then auto-discovered ones) until one works."""
-    if not GEMINI_API_KEY:
-        return {"ok": False, "setup": True,
-                "error": "GEMINI_API_KEY is not configured on the server."}
-
-    candidates = list(GEMINI_MODELS)
-    tried = set()
-    discovered_used = False
-    last_err = "no model was attempted"
-    idx = 0
-
-    while idx < len(candidates):
-        model = candidates[idx]
-        idx += 1
-        if model in tried:
-            continue
-        tried.add(model)
-        res = _gemini_once(model, prompt)
-        if res["ok"]:
-            return {"ok": True, "model": model, "text": res["text"]}
-        last_err = f"{model}: {res['error']}"
-        # unknown model -> pull the real model list once, try those too
-        if res["status"] == 404 and not discovered_used:
-            discovered_used = True
-            for m in _discover_models():
-                if m not in candidates:
-                    candidates.append(m)
-
-    # everything configured failed for other reasons - last resort discovery
-    if not discovered_used:
-        for m in _discover_models():
-            if m in tried:
-                continue
-            res = _gemini_once(m, prompt)
-            if res["ok"]:
-                return {"ok": True, "model": m, "text": res["text"]}
-            last_err = f"{m}: {res['error']}"
-
-    return {"ok": False, "error": f"All Gemini models failed. Last error: {last_err}"}
-
-
-# ============================ PROFILE SANITIZING ============================
-
-def sanitize_profile(raw):
-    """Normalize + harden any incoming trip profile into a safe dict."""
-    raw = raw or {}
-    p = {}
-
-    # 1 - city + tour theme
-    p["city"] = _txt(raw.get("city"), 80)
-    p["destination"] = _txt(raw.get("destination"), 300)
-
-    # 2 - group
-    g = raw.get("group") or {}
-    gtype = "Group" if str(g.get("type", "")).strip().lower().startswith("g") else "Solo"
-    count = _int(g.get("count"), 1, 1, 100)
-    if gtype == "Solo":
-        count = 1
-    p["group_type"] = gtype
-    p["count"] = count
-    p["group_display"] = f"{gtype} ({count} Traveler{'s' if count > 1 else ''})"
-
-    # 3 - age group
-    p["age_group"] = _txt(raw.get("age_group"), 120) or "Mixed Age Group"
-
-    # 4 - duration / calendar dates
-    t = raw.get("travel") or {}
-    if str(t.get("type", "")).strip().lower() == "dates":
-        s, e = _parse_dmy(t.get("start")), _parse_dmy(t.get("end"))
-        if s and e and e > s:
-            dur = min((e - s).days, 120)
-            p["travel"] = {
-                "type": "dates",
-                "start": f"{s:%d/%m/%Y}", "end": f"{e:%d/%m/%Y}",
-                "duration": dur,
-                "display": f"{s:%d/%m/%Y} to {e:%d/%m/%Y} "
-                           f"({dur} Days with Full Year)",
-            }
-        else:
-            p["travel"] = {"type": "days", "duration": 5, "display": "5 Days Trip"}
+def save_plan(doc):
+    db = get_db()
+    if db is not None:
+        db.insert_one(dict(doc))
     else:
-        dur = _int(t.get("duration"), 5, 1, 120)
-        p["travel"] = {"type": "days", "duration": dur, "display": f"{dur} Days Trip"}
-
-    # calendar labels (Gemini puts real dates on every day when known)
-    p["day_labels"] = []
-    if p["travel"]["type"] == "dates":
-        s = _parse_dmy(p["travel"]["start"])
-        for i in range(p["travel"]["duration"]):
-            d = s + timedelta(days=i)
-            p["day_labels"].append(f"Day {i + 1} ({d:%a, %d %b %Y})")
-
-    # 5 - travelers
-    m = raw.get("members") or {}
-    src = m.get("list") or m.get("members") or []
-    members = []
-    for x in src[:count]:
-        gdr = str(_txt(x.get("gender"), 10)).lower()
-        gender = ("Male" if gdr.startswith("m") else
-                 "Female" if gdr.startswith("f") else "Other")
-        members.append({
-            "name": _txt(x.get("name"), 60) or f"Traveler {len(members) + 1}",
-            "age": _int(x.get("age"), 25, 1, 120),
-            "gender": gender,
-        })
-    while len(members) < count:
-        members.append({"name": f"Traveler {len(members) + 1}",
-                        "age": 25, "gender": "Other"})
-    males = sum(1 for x in members if x["gender"] == "Male")
-    females = sum(1 for x in members if x["gender"] == "Female")
-    summary = f"\n      - Count: {males} Males, {females} Females"
-    for x in members:
-        summary += f"\n      - {x['name']} ({x['age']} yrs, {x['gender']})"
-    p["members"] = {"males": males, "females": females, "list": members}
-    p["members_summary"] = summary
-
-    # 6 - relationship / 7 - budget
-    p["relationship"] = _txt(raw.get("relationship"), 160) or "Mixed Group"
-    b = raw.get("budget") or {}
-    p["budget"] = _txt(b.get("range") if isinstance(b, dict) else b, 200) \
-        or "Mid Range"
-    amount = re.sub(r"\D", "", str(b.get("amount", "")))[:9] \
-        if isinstance(b, dict) else ""
-    p["budget_amount"] = amount
-    p["budget_display"] = p["budget"] + (f" | Target Total: \u20b9{amount}"
-                                         if amount else "")
-
-    # 8 - transport (+ personal vehicle details)
-    t = raw.get("transport") or {}
-    mode = _txt(t.get("mode") if isinstance(t, dict) else t, 120) or "Personal Vehicle"
-    vehicle = _txt(t.get("vehicle"), 12).upper() if isinstance(t, dict) else ""
-    if vehicle not in ("CAR", "SUV", "BIK", "VAN"):
-        vehicle = ""
-    seats = _txt(t.get("seats"), 10) if isinstance(t, dict) else ""
-    display = mode
-    if vehicle:
-        display += f" - [{vehicle}]"
-    if seats:
-        display += f" (Seater: {seats})"
-    p["transport"] = mode
-    p["vehicle"] = vehicle
-    p["seats"] = seats
-    p["transport_display"] = display
-
-    # 9 - food
-    f = raw.get("food") or {}
-    diet = _txt(f.get("diet") if isinstance(f, dict) else f, 160) or "Pure Vegetarian"
-    allergy = _txt(f.get("allergy"), 200) if isinstance(f, dict) else ""
-    p["food"] = diet
-    p["allergies"] = allergy
-    p["food_display"] = diet + (f" | Notes: {allergy}" if allergy else "")
-
-    # 10 - stay + city echo done above
-    p["stay"] = _txt(raw.get("stay"), 160) or "Any place is fine (Best budget combo)"
-
-    return p
+        docs = _fallback_load()
+        docs.append(doc)
+        _fallback_save(docs)
+    return doc["plan_id"]
 
 
-def validate_profile(p):
-    problems = []
-    if len(p["destination"]) < 3:
-        problems.append("Please describe your tour theme/destination (Q1).")
-    if p["count"] < 1:
-        problems.append("Group size must be at least 1 traveler.")
-    if p["travel"]["duration"] < 1:
-        problems.append("Trip duration must be at least 1 day.")
-    return problems
+def list_plans(limit=20):
+    db = get_db()
+    if db is not None:
+        cur = db.find({}, {"plan": 0}).sort("created_at", -1).limit(limit)
+        return list(cur)
+    return sorted(_fallback_load(), key=lambda x: x.get("created_at", ""),
+                  reverse=True)[:limit]
 
 
-# ================================ THE PROMPT ================================
-
-def build_prompt(p):
-    city = p["city"] or p["destination"].split(",")[0]
-    cal = ""
-    if p["day_labels"]:
-        cal = "\nCalendar day labels (use these exact labels for each day):\n" + \
-              "\n".join(f"  - {d}" for d in p["day_labels"])
-    concise = ("\n- Because the trip is long, keep each time-of-day line to ONE short sentence."
-               if p["travel"]["duration"] > 14 else "")
-
-    return f"""You are a master Travel Guide and Tour Planner AI with deep knowledge of
-destinations, routes, seasons, hidden gems, local food and realistic Indian prices.
-
-==================================================
-              TRAVELER REQUIREMENTS
-==================================================
- 1. Destination City / Region : {city}
- 2. Tour Theme / Focus        : {p['destination']}
- 3. Group Size                : {p['group_display']}
- 4. Age Group                 : {p['age_group']}
- 5. Duration / Dates          : {p['travel']['display']}
- 6. Traveler Profiles         :{p['members_summary']}
- 7. Group Dynamic             : {p['relationship']}
- 8. Budget Category           : {p['budget_display']}
- 9. Transport                 : {p['transport_display']}
-10. Food Diet                 : {p['food_display']}
-11. Stay Preference           : {p['stay']}
-{cal}
-
-Build a comprehensive, realistic, highly detailed day-by-day travel plan for
-EXACTLY {p['travel']['duration']} day(s).
-
-==================================================
-          REQUIRED OUTPUT FORMAT (Markdown)
-==================================================
-First line must be:
-# {city} - <short catchy trip title>
-Then a 2-3 line trip summary paragraph.
-
-Then these sections, with EXACTLY these "## " headings, in this order:
-
-## \U0001F4CD 1. Must-Visit Places & Hidden Gems
-- 6-10 specific named attractions/viewpoints/routes with best visiting time
-  and a one-line reason to go.
-
-## \U0001F5FA\uFE0F 2. Day-by-Day Itinerary
-One block per day (all {p['travel']['duration']} days), each exactly:
-**Day N - <Short Title>**
-**Morning:** <places, start time, travel time, entry fee if any>
-**Afternoon:** <places, lunch stop, travel time>
-**Evening:** <activity, dinner spot, night vibe>
-
-## \U0001F3E8 3. Recommended Stays
-- 2-3 realistic property names for each night-stop region that match the stay
-  preference and budget, with \u20b9 price per night.
-
-## \U0001F37D\uFE0F 4. Food & Restaurant Recommendations
-- Specific eatery names plus the exact local dishes to try, strictly matching
-  the diet preference ({p['food_display']}).
-
-## \U0001F4B0 5. Estimated Budget (\u20b9 INR)
-- A markdown table with columns: Category | Details | Estimated Cost (\u20b9)
-  and rows: Stay, Food, Local Transport/Fuel, Entry Tickets, Miscellaneous.
-- Then finish the section with two bold lines:
-**Per Person: \u20b9<amount>**
-**Total Estimated Cost: \u20b9<amount>**
-
-## \U0001F392 6. Essential Packing & Safety
-- Weather-suitable gear, clothing etiquette for cultural/religious sites,
-  first-aid, and advice tailored to this exact age group and group dynamic.
-
-## \u2728 7. Smart Local Tips & Hidden Secrets
-- 5-7 insider tips: timing hacks, ticket booking, scams to avoid, photo spots.
-
-RULES:
-- Realistic Indian Rupee (\u20b9) pricing aligned with: {p['budget']}.
-- Bold every place/property/dish name and every price.
-- Short lines and bullet points only - no walls of text.{concise}
-- No code blocks. No asking questions - just deliver the plan."""
+def get_plan(pid):
+    db = get_db()
+    if db is not None:
+        return db.find_one({"plan_id": pid})
+    for doc in _fallback_load():
+        if doc.get("plan_id") == pid:
+            return doc
+    return None
 
 
-# ============================== API ENDPOINTS ==============================
-
-def api_home():
-    """GET / - serve the frontend locally, info JSON everywhere else."""
-    if os.path.exists(ROOT_HTML):
-        try:
-            return send_file(ROOT_HTML)
-        except Exception:
-            pass
-    return _json({
-        "success": True,
-        "service": "AI Tour Planner API",
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "mongodb_available": bool(_mongo()),
-        "endpoints": [
-            "GET  /api/health", "POST /api/plan", "GET  /api/plans",
-            "GET  /api/plan/<id>", "DELETE /api/plan/<id>",
-            "POST /api/plan/<id>/feedback",
-        ],
-    })
+def delete_plan(pid):
+    db = get_db()
+    if db is not None:
+        return db.delete_one({"plan_id": pid}).deleted_count > 0
+    docs = _fallback_load()
+    new = [d for d in docs if d.get("plan_id") != pid]
+    _fallback_save(new)
+    return len(new) != len(docs)
 
 
-def api_health():
-    return _json({
-        "success": True,
-        "status": "ok",
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "mongodb_available": bool(_mongo()),
-        "models": GEMINI_MODELS,
-        "time": datetime.now(timezone.utc).isoformat(),
-    })
-
-
-def api_generate():
-    """POST /api/plan - build prompt, call Gemini, save to MongoDB."""
-    raw = request.get_json(silent=True) or {}
-    profile = sanitize_profile(raw)
-    problems = validate_profile(profile)
-    if problems:
-        return _json({"success": False, "error": " | ".join(problems)}, 400)
-
-    result = call_gemini(build_prompt(profile))
-    if not result.get("ok"):
-        payload = {"success": False, "error": result.get("error", "Gemini failed")}
-        if result.get("setup"):
-            payload["setup"] = True
-            payload["error"] = ("Server is missing its Gemini API key. Add "
-                                "GEMINI_API_KEY in Vercel -> Settings -> "
-                                "Environment Variables, then redeploy.")
-            payload["hint"] = "Free key: https://aistudio.google.com/app/apikey"
-        else:
-            payload["hint"] = ("Free-tier Gemini keys have rate limits - wait a "
-                               "minute and retry, or check the model list.")
-        return _json(payload, 502)
-
-    share_id, saved = None, False
-    doc = {
-        "_id": "",
-        "share_id": "",
-        "profile": profile,
-        "plan_text": result["text"],
-        "model": result["model"],
-        "rating": 0,
-        "views": 0,
-        "created_at": datetime.now(timezone.utc),
+# --------------------------------------------------------------------------
+# GEMINI API  (multi-model fallback)
+# --------------------------------------------------------------------------
+def call_gemini_api(prompt):
+    """Try each model in order; return (text, model_used). Raise on total fail."""
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 8192},
     }
-    if _mongo() is not None:
-        doc["_id"] = doc["share_id"] = secrets.token_urlsafe(6)
-        saved = _save_plan(doc)
-        if not saved:
-            doc["share_id"] = ""
-
-    return _json({
-        "success": True,
-        "share_id": doc["share_id"] or None,
-        "mongo_saved": saved,
-        "plan": result["text"],
-        "model": result["model"],
-        "profile": profile,
-    })
-
-
-def api_list_plans():
-    """GET /api/plans - recent saved plans (metadata only)."""
-    db = _mongo()
-    if db is None:
-        return _json({"success": False, "plans": [],
-                      "reason": "MongoDB not configured"})
-    try:
-        limit = _int(request.args.get("limit"), 12, 1, 50)
-        cur = db.plans.find({}, {"profile": 1, "model": 1, "rating": 1,
-                                 "views": 1, "created_at": 1}) \
-            .sort("created_at", -1).limit(limit)
-        plans = [_plan_meta(d) for d in cur]
-        return _json({"success": True, "plans": plans})
-    except Exception as e:
-        return _json({"success": False, "plans": [], "error": str(e)[:200]})
-
-
-def api_get_plan(share_id):
-    """GET /api/plan/<id> - fetch one full plan."""
-    db = _mongo()
-    if db is None:
-        return _json({"success": False,
-                      "error": "MongoDB not configured - shared links are "
-                               "disabled. Add MONGODB_URI to enable them."}, 503)
-    try:
-        sid = _txt(share_id, 40)
-        doc = db.plans.find_one({"_id": sid}) or db.plans.find_one({"share_id": sid})
-        if not doc:
-            return _json({"success": False, "error": "Plan not found"}, 404)
+    last_err = None
+    for model in GEMINI_MODELS:
         try:
-            db.plans.update_one({"_id": doc.get("_id")},
-                                {"$inc": {"views": 1}})
-        except Exception:
-            pass
-        doc.pop("_id", None)
-        doc["created_at"] = _iso(doc.get("created_at"))
-        return _json({"success": True, "plan": doc})
-    except Exception as e:
-        return _json({"success": False, "error": str(e)[:200]}, 500)
+            res = requests.post(GEMINI_URL.format(model=model),
+                                headers=HEADERS, json=payload, timeout=90)
+            if res.status_code != 200:
+                last_err = "%s -> HTTP %d" % (model, res.status_code)
+                continue
+            text = (res.json()["candidates"][0]["content"]["parts"][0]["text"])
+            if text and text.strip():
+                return text, model
+            last_err = "%s -> empty response" % model
+        except Exception as exc:
+            last_err = "%s -> %s" % (model, exc)
+    raise RuntimeError("All Gemini models failed. Last error: %s" % last_err)
 
 
-def api_delete_plan(share_id):
-    """DELETE /api/plan/<id>."""
-    db = _mongo()
-    if db is None:
-        return _json({"success": False, "deleted": False,
-                      "reason": "MongoDB not configured"})
+# --------------------------------------------------------------------------
+# PROMPT BUILDER  (mirrors the original CLI script)
+# --------------------------------------------------------------------------
+def build_gemini_prompt(d):
+    total_days = d["total_days"]
+    if d["date_mode"] == "dates" and d.get("start_date") and d.get("end_date"):
+        duration = "%d days (%s to %s)" % (total_days, d["start_date"],
+                                           d["end_date"])
+    else:
+        duration = "%d days" % total_days
+
+    if d["group_type"] == "solo":
+        group_line = "Solo traveler (1 person)"
+    else:
+        group_line = "Group of %d people" % d["group_size"]
+
+    member_lines = []
+    for i, m in enumerate(d["members"], 1):
+        member_lines.append("    %d. %s | Age %s | Gender %s"
+                            % (i, m["name"], m["age"], m["gender"]))
+    members_block = "\n".join(member_lines)
+
+    lines = []
+    lines.append("You are an expert AI travel planner with deep local "
+                 "knowledge of destinations across the world.")
+    lines.append("Create a complete, detailed and personalized tour plan "
+                 "for the trip described below.")
+    lines.append("")
+    lines.append("========== TRIP DETAILS ==========")
+    lines.append("Destination        : %s" % d["destination"])
+    lines.append("Group Type         : %s" % group_line)
+    lines.append("Age Group          : %s" % d["age_group"])
+    lines.append("Trip Duration      : %s" % duration)
+    lines.append("Traveler Details   :")
+    lines.append(members_block)
+    lines.append("Relationship       : %s" % d["relationship"])
+    lines.append("Budget Category    : %s (%s)"
+                 % (d["budget_tier"], BUDGET_RANGES[d["budget_tier"]]))
+    if d.get("total_budget"):
+        lines.append("Total Trip Budget  : INR %s (plan strictly within this "
+                    "total amount)" % d["total_budget"])
+    lines.append("Preferred Transport: %s" % d["transport"])
+    if d["transport"] == "Personal":
+        lines.append("Personal Vehicle   : %s with %s seats"
+                     % (d.get("vehicle_type", "CAR"), d.get("vehicle_seats", 4)))
+    lines.append("Food Preference    : %s" % d["food_preference"])
+    if d.get("allergies"):
+        lines.append("Allergies / Food restrictions to avoid: %s"
+                     % d["allergies"])
+    lines.append("Stay Preference    : %s" % d["stay_preference"])
+    lines.append("")
+    lines.append("========== REQUIRED OUTPUT FORMAT ==========")
+    lines.append("Write the plan in markdown and include these EXACT 6 "
+                 "sections with these headers:")
+    lines.append("1. '# \U0001F4CD Must-Visit Places & Hidden Gems' — top "
+                 "attractions plus lesser-known local gems, with a one-line "
+                 "reason and typical entry ticket price in INR for each.")
+    lines.append("2. '# \U0001F5FA Day-by-Day Itinerary' — a full plan for "
+                 "ALL %d days, each day split into Morning / Afternoon / "
+                 "Evening with specific places, timings and travel tips."
+                 % total_days)
+    lines.append("3. '# \U0001F3E8 Recommended Stays' — 2-3 property "
+                 "suggestions matching the stay preference, with approximate "
+                 "price per night in INR.")
+    lines.append("4. '# \U0001F37D Food & Restaurants' — where to eat, "
+                 "matching the food preference, with must-try dishes and "
+                 "approximate cost per meal in INR.")
+    lines.append("5. '# \U0001F4B0 Detailed Budget Breakdown' — a realistic "
+                 "table (Stay / Food / Transport / Tickets / Miscellaneous) "
+                 "per person and grand total in INR.")
+    lines.append("6. '# \U0001F392 Packing & Safety Advice' — packing list "
+                 "for this destination and season, plus safety tips and "
+                 "emergency contacts.")
+    lines.append("")
+    lines.append("Be specific, use real place names, keep all money in INR, "
+                 "and make the plan practical for the group described above.")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# REQUEST VALIDATION  (mirrors the CLI input rules)
+# --------------------------------------------------------------------------
+def validate_request(d):
+    errors = []
+
+    def s(v):
+        return str(v).strip() if v is not None else ""
+
+    clean = {}
+
+    destination = s(d.get("destination"))
+    if len(destination) < 5:
+        errors.append("Destination must be at least 5 characters.")
+    clean["destination"] = destination
+
+    group_type = s(d.get("group_type")).lower()
+    if group_type not in ("solo", "group"):
+        errors.append("Group type must be 'solo' or 'group'.")
+        group_type = "solo"
+    clean["group_type"] = group_type
+
     try:
-        res = db.plans.delete_one({"_id": _txt(share_id, 40)})
-        return _json({"success": True, "deleted": res.deleted_count > 0})
-    except Exception as e:
-        return _json({"success": False, "error": str(e)[:200]})
+        group_size = int(d.get("group_size", 1))
+    except (TypeError, ValueError):
+        group_size = 1
+    if group_type == "solo":
+        group_size = 1
+    elif not (2 <= group_size <= 100):
+        errors.append("Group size must be between 2 and 100 for groups.")
+        group_size = 1
+    clean["group_size"] = group_size
+
+    age_group = s(d.get("age_group"))
+    if age_group not in VALID["age_groups"]:
+        errors.append("Invalid age group.")
+    clean["age_group"] = age_group
+
+    # --- dates: either total days, or a DD/MM/YYYY range (1-120 days) ---
+    date_mode = s(d.get("date_mode")) or "days"
+    total_days = None
+    start_date = s(d.get("start_date")) or None
+    end_date = s(d.get("end_date")) or None
+    if date_mode == "dates":
+        try:
+            sd = datetime.strptime(start_date, "%d/%m/%Y").date()
+            ed = datetime.strptime(end_date, "%d/%m/%Y").date()
+            if ed < sd:
+                errors.append("End date cannot be before start date.")
+            total_days = (ed - sd).days + 1
+            if total_days < 1 or total_days > 120:
+                errors.append("Trip must be between 1 and 120 days.")
+                total_days = None
+        except (TypeError, ValueError):
+            errors.append("Start/end dates must be valid DD/MM/YYYY.")
+    else:
+        try:
+            total_days = int(d.get("total_days"))
+            if not (1 <= total_days <= 120):
+                errors.append("Total days must be between 1 and 120.")
+                total_days = None
+        except (TypeError, ValueError):
+            errors.append("Total days must be a number between 1 and 120.")
+    if total_days is None:
+        errors.append("A valid trip duration is required.")
+    clean["date_mode"] = date_mode
+    clean["total_days"] = total_days
+    clean["start_date"] = start_date
+    clean["end_date"] = end_date
+
+    # --- members: one row per traveler, ages 1-120, gender M/F/O ---
+    members = d.get("members") or []
+    if not isinstance(members, list) or len(members) != group_size:
+        errors.append("Member details are required for all %d traveler(s)."
+                      % group_size)
+        members = []
+    else:
+        for i, m in enumerate(members, 1):
+            name = s(m.get("name"))
+            if len(name) < 2:
+                errors.append("Member %d: name is required (min 2 characters)."
+                              % i)
+            try:
+                age = int(m.get("age"))
+                if not (1 <= age <= 120):
+                    raise ValueError
+            except (TypeError, ValueError):
+                age = None
+                errors.append("Member %d: age must be between 1 and 120." % i)
+            gender = s(m.get("gender")).upper()
+            if gender not in ("M", "F", "O"):
+                gender = None
+                errors.append("Member %d: gender must be M, F or O." % i)
+            members[i - 1] = {"name": name, "age": age, "gender": gender}
+    clean["members"] = members
+
+    relationship = s(d.get("relationship"))
+    if relationship not in VALID["relationships"]:
+        errors.append("Invalid relationship type.")
+    clean["relationship"] = relationship
+
+    budget_tier = s(d.get("budget_tier"))
+    if budget_tier not in VALID["budget_tiers"]:
+        errors.append("Invalid budget tier.")
+    clean["budget_tier"] = budget_tier
+
+    total_budget = s(d.get("total_budget"))
+    if total_budget:
+        try:
+            tb = int(float(total_budget))
+            if tb <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            errors.append("Total budget must be a positive number.")
+            total_budget = None
+    clean["total_budget"] = total_budget or None
+
+    transport = s(d.get("transport"))
+    if transport not in VALID["transports"]:
+        errors.append("Invalid transport option.")
+    clean["transport"] = transport
+
+    vehicle_type = s(d.get("vehicle_type")).upper()
+    if transport == "Personal":
+        if vehicle_type not in VALID["vehicles"]:
+            errors.append("Vehicle type must be CAR, SUV, VAN or BIKE.")
+            vehicle_type = "CAR"
+        try:
+            seats = int(d.get("vehicle_seats"))
+            if not (1 <= seats <= 50):
+                raise ValueError
+        except (TypeError, ValueError):
+            seats = None
+            errors.append("Vehicle seats must be between 1 and 50.")
+    else:
+        vehicle_type, seats = None, None
+    clean["vehicle_type"] = vehicle_type
+    clean["vehicle_seats"] = seats
+
+    food_preference = s(d.get("food_preference"))
+    if food_preference not in VALID["food_prefs"]:
+        errors.append("Invalid food preference.")
+    clean["food_preference"] = food_preference
+    clean["allergies"] = s(d.get("allergies")) or None
+
+    stay_preference = s(d.get("stay_preference"))
+    if stay_preference not in VALID["stays"]:
+        errors.append("Invalid stay preference.")
+    clean["stay_preference"] = stay_preference
+
+    return (len(errors) == 0), errors, clean
 
 
-def api_feedback(share_id):
-    """POST /api/plan/<id>/feedback - {"rating": 1|-1|0}."""
-    db = _mongo()
-    if db is None:
-        return _json({"success": False, "rating": None,
-                      "reason": "MongoDB not configured"})
-    try:
-        body = request.get_json(silent=True) or {}
-        rating = _int(body.get("rating"), 0, -1, 1)
-        db.plans.update_one({"_id": _txt(share_id, 40)},
-                             {"$set": {"rating": rating}})
-        return _json({"success": True, "rating": rating})
-    except Exception as e:
-        return _json({"success": False, "error": str(e)[:200]})
-
-
-# ============================ CATCH-ALL ROUTER ============================
-# The Flask app may be mounted at "/", "/api" or "/api/index" depending on
-# how it is invoked (Vercel warm instance, local run, CLI...). This router
-# normalizes ANY of those prefixes and dispatches by clean path, so the
-# endpoints work identically at /api/plan, /plan and /api/index/plan.
-
-def _normalize(path):
-    p = "/" + (path or "").strip("/")
-    for prefix in ("/api/index", "/api", "/index"):
-        if p == prefix:
-            return "/"
-        if p.startswith(prefix + "/"):
-            return p[len(prefix):]
-    return p
-
-
+# --------------------------------------------------------------------------
+# ROUTES
+# --------------------------------------------------------------------------
 @app.after_request
-def _cors(resp):
-    h = resp.headers
-    h["Access-Control-Allow-Origin"] = "*"
-    h["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
-    h["Access-Control-Allow-Headers"] = "Content-Type"
-    h["Cache-Control"] = "no-store"
+def cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,DELETE,OPTIONS"
     return resp
 
 
-@app.route("/", defaults={"path": ""},
-           methods=["GET", "POST", "DELETE", "OPTIONS"])
-@app.route("/<path:path>",
-           methods=["GET", "POST", "DELETE", "OPTIONS"])
-def router(path=""):
+@app.route("/", defaults={"path": ""})
+@app.route("/<path:path>")
+def catch_all(path):
+    """Serve the frontend for every non-API path (fixes Unknown endpoint)."""
+    if path.startswith("api/"):
+        return jsonify({"success": False,
+                        "error": "Unknown endpoint: %s /%s"
+                                 % (request.method, path)}), 404
+    full = os.path.join(BASE_DIR, path)
+    if path and os.path.isfile(full) and not path.endswith(".py"):
+        return send_file(full)
+    return send_file(os.path.join(BASE_DIR, "index.html"))
+
+
+@app.route("/api/health")
+def api_health():
+    return jsonify({"success": True, "status": "ok",
+                    "storage": "mongodb" if get_db() is not None
+                               else "local-file-fallback",
+                    "models": GEMINI_MODELS})
+
+
+@app.route("/api/options")
+def api_options():
+    return jsonify({"success": True, "options": VALID,
+                    "budget_ranges": BUDGET_RANGES})
+
+
+@app.route("/api/generate", methods=["POST", "OPTIONS"])
+def api_generate():
     if request.method == "OPTIONS":
-        return "", 204
+        return ("", 204)
+    data = request.get_json(silent=True) or {}
+    ok, errors, clean = validate_request(data)
+    if not ok:
+        return jsonify({"success": False,
+                        "error": "Please fix the highlighted answers.",
+                        "details": errors}), 400
 
-    route = _normalize(request.path)
-    seg = [s for s in route.strip("/").split("/") if s]
-    method = request.method
+    prompt = build_gemini_prompt(clean)
+    try:
+        plan_text, model_used = call_gemini_api(prompt)
+    except Exception as exc:
+        return jsonify({"success": False,
+                        "error": "Gemini API failed: %s" % exc}), 502
 
-    # GET  /  -> home (frontend when local, info JSON otherwise)
-    if route == "/" and method == "GET":
-        return api_home()
+    doc = {
+        "plan_id": uuid.uuid4().hex,
+        "destination": clean["destination"],
+        "group_type": clean["group_type"],
+        "group_size": clean["group_size"],
+        "total_days": clean["total_days"],
+        "budget_tier": clean["budget_tier"],
+        "transport": clean["transport"],
+        "created_at": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "model_used": model_used,
+        "request": clean,
+        "plan": plan_text,
+    }
+    try:
+        plan_id = save_plan(doc)
+    except Exception:
+        plan_id = None  # storage failure should never kill a generated plan
 
-    if seg[:1] == ["health"] and method == "GET":
-        return api_health()
-
-    if seg[:1] == ["plan"]:
-        rest = seg[1:]
-        if not rest and method == "POST":
-            return api_generate()                       # POST /plan
-        if len(rest) == 1:
-            if method == "GET":
-                return api_get_plan(rest[0])            # GET /plan/<id>
-            if method == "DELETE":
-                return api_delete_plan(rest[0])         # DELETE /plan/<id>
-        if len(rest) == 2 and rest[1] == "feedback" and method == "POST":
-            return api_feedback(rest[0])                # POST /plan/<id>/feedback
-
-    if seg[:1] == ["plans"] and method == "GET":
-        return api_list_plans()                         # GET /plans
-
-    return _json({"success": False,
-                  "error": f"Unknown endpoint: {method} {route}"}, 404)
+    return jsonify({"success": True, "plan_id": plan_id,
+                    "model": model_used, "plan": plan_text,
+                    "summary": doc["created_at"]})
 
 
-# ============================== LOCAL RUNNER ==============================
+@app.route("/api/history")
+def api_history():
+    try:
+        plans = list_plans(int(request.args.get("limit", 20)))
+    except Exception:
+        plans = []
+    for p in plans:
+        p["plan_id"] = p.get("plan_id") or str(p.get("_id", ""))
+        p.pop("_id", None)
+    return jsonify({"success": True, "count": len(plans), "plans": plans})
 
+
+@app.route("/api/plan/<pid>", methods=["GET", "DELETE"])
+def api_plan(pid):
+    if request.method == "DELETE":
+        deleted = delete_plan(pid)
+        return jsonify({"success": deleted}), (200 if deleted else 404)
+    doc = get_plan(pid)
+    if not doc:
+        return jsonify({"success": False, "error": "Plan not found."}), 404
+    doc.pop("_id", None)
+    return jsonify({"success": True, "plan": doc})
+
+
+# --------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("\n" + "=" * 65)
-    print("  AI TOUR PLANNER - Flask backend (Gemini + MongoDB)")
-    print("=" * 65)
-    print("  Gemini key  :", "set" if GEMINI_API_KEY else "MISSING (set GEMINI_API_KEY)")
-    print("  MongoDB     :", "set" if MONGODB_URI else "not set (cloud saving disabled)")
-    print("  Models      :", ", ".join(GEMINI_MODELS))
-    print("  Serving     : http://localhost:5000  (app + API)")
-    print("=" * 65 + "\n")
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)),
+            debug=True)
